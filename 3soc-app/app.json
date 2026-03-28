@@ -3,6 +3,7 @@
     "name": "3SOC Detection",
     "slug": "3soc-app",
     "version": "1.0.0",
+    "newArchEnabled": true,
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",

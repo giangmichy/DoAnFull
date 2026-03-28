@@ -6,8 +6,10 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import { apiClient, VideoFile, ViolationImage } from '../api';
 import { BACKEND_BASE_URL } from '../config';
+import BoundingBoxOverlay from '../components/BoundingBoxOverlay';
 
 const PAGE_SIZE = 10;
+type SseController = { close: () => void };
 
 export default function FilesScreen() {
   const [files, setFiles] = useState<VideoFile[]>([]);
@@ -26,7 +28,88 @@ export default function FilesScreen() {
   const [processedFrames, setProcessedFrames] = useState(0);
   const [totalFrames, setTotalFrames] = useState(0);
   const [selectedViolation, setSelectedViolation] = useState<ViolationImage | null>(null);
-  const sseRef = React.useRef<AbortController | null>(null);
+  const [selectedImageNaturalSize, setSelectedImageNaturalSize] = useState({ width: 0, height: 0 });
+  const [selectedImageLayoutSize, setSelectedImageLayoutSize] = useState({ width: 0, height: 0 });
+  const sseRef = React.useRef<SseController | null>(null);
+
+  const startSseStream = useCallback(
+    (
+      url: string,
+      onMessage: (rawData: string) => void,
+      onEnd?: () => void,
+      onError?: (error: Error) => void,
+    ): SseController => {
+      const xhr = new XMLHttpRequest();
+      let lastProcessedIndex = 0;
+      let buffer = '';
+
+      const flushBuffer = () => {
+        const events = buffer.split('\n\n');
+        buffer = events.pop() || '';
+
+        events.forEach((eventBlock) => {
+          if (!eventBlock.trim()) return;
+
+          const dataLines = eventBlock
+            .split('\n')
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart());
+
+          if (dataLines.length === 0) return;
+          onMessage(dataLines.join('\n'));
+        });
+      };
+
+      xhr.onprogress = () => {
+        const responseText = xhr.responseText || '';
+        if (responseText.length <= lastProcessedIndex) return;
+
+        const chunk = responseText.slice(lastProcessedIndex);
+        lastProcessedIndex = responseText.length;
+        buffer += chunk.replace(/\r\n/g, '\n');
+        flushBuffer();
+      };
+
+      xhr.onreadystatechange = () => {
+        if (xhr.readyState !== XMLHttpRequest.DONE) return;
+
+        if (xhr.status >= 200 && xhr.status < 300) {
+          if (buffer.trim()) {
+            buffer += '\n\n';
+            flushBuffer();
+          }
+          onEnd?.();
+          return;
+        }
+
+        if (xhr.status !== 0) {
+          onError?.(new Error(`SSE request failed with status ${xhr.status}`));
+        }
+      };
+
+      xhr.onerror = () => onError?.(new Error('SSE network error'));
+
+      xhr.open('GET', url, true);
+      xhr.setRequestHeader('Accept', 'text/event-stream');
+      xhr.setRequestHeader('Cache-Control', 'no-cache');
+
+      const token = apiClient.getToken();
+      if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+
+      xhr.send();
+
+      return {
+        close: () => {
+          try {
+            xhr.abort();
+          } catch {
+            // ignore abort error
+          }
+        },
+      };
+    },
+    [],
+  );
 
   const loadFiles = useCallback(async (targetPage = page) => {
     try {
@@ -75,55 +158,50 @@ export default function FilesScreen() {
     setDetecting(true);
     setDetectModalVisible(true);
 
-    const controller = new AbortController();
-    sseRef.current = controller;
+    if (sseRef.current) {
+      sseRef.current.close();
+      sseRef.current = null;
+    }
 
     const streamUrl = `${BACKEND_BASE_URL}/api/files/${fileId}/detect-stream`;
 
-    fetch(streamUrl, { signal: controller.signal })
-      .then(async (response) => {
-        const reader = response.body?.getReader();
-        if (!reader) return;
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const msg = JSON.parse(line.slice(6));
-                if (msg.type === 'init' || msg.type === 'metadata') {
-                  setTotalFrames(msg.total_frames || 0);
-                } else if (msg.type === 'violation' && msg.data) {
-                  setViolations(prev => [...prev, msg.data]);
-                  setProcessedFrames(prev => Math.max(prev, msg.data.frame_number || 0));
-                } else if (msg.type === 'complete') {
-                  // done
-                }
-              } catch { /* skip */ }
-            }
+    sseRef.current = startSseStream(
+      streamUrl,
+      (raw) => {
+        try {
+          const msg = JSON.parse(raw);
+          if (msg.type === 'init' || msg.type === 'metadata') {
+            setTotalFrames(msg.total_frames || 0);
+          } else if (msg.type === 'violation' && msg.data) {
+            setViolations((prev) => {
+              const exists = prev.some(
+                (v) => v.frame_number === msg.data.frame_number && v.timestamp === msg.data.timestamp,
+              );
+              if (exists) return prev;
+              return [...prev, msg.data];
+            });
+            setProcessedFrames((prev) => Math.max(prev, msg.data.frame_number || 0));
+          } else if (msg.type === 'complete') {
+            setDetecting(false);
           }
+        } catch {
+          // skip invalid chunk
         }
-      })
-      .catch((err) => {
-        if (err.name !== 'AbortError') console.warn('SSE error:', err);
-      })
-      .finally(() => setDetecting(false));
+      },
+      () => setDetecting(false),
+      () => setDetecting(false),
+    );
   };
 
   const closeDetectModal = () => {
     if (sseRef.current) {
-      sseRef.current.abort();
+      sseRef.current.close();
       sseRef.current = null;
     }
     setDetectModalVisible(false);
     setDetecting(false);
+    setSelectedImageNaturalSize({ width: 0, height: 0 });
+    setSelectedImageLayoutSize({ width: 0, height: 0 });
   };
 
   const formatSize = (bytes?: number) => {
@@ -147,6 +225,12 @@ export default function FilesScreen() {
     co3soc: 'Cờ 3 sọc',
     duongluoibo: 'Đường lưỡi bò',
     vnmap: 'Bản đồ VN',
+  };
+
+  const modelColorMap: Record<string, string> = {
+    co3soc: '#ef4444',
+    duongluoibo: '#22c55e',
+    vnmap: '#3b82f6',
   };
 
   const renderFileItem = ({ item, index }: { item: VideoFile; index: number }) => (
@@ -277,7 +361,10 @@ export default function FilesScreen() {
                     <TouchableOpacity
                       key={idx}
                       style={styles.violationGridItem}
-                      onPress={() => setSelectedViolation(v)}
+                      onPress={() => {
+                        setSelectedViolation(v);
+                        setSelectedImageNaturalSize({ width: 0, height: 0 });
+                      }}
                     >
                       <Image source={{ uri: imgUrl }} style={styles.violationGridImage} resizeMode="cover" />
                       <View style={styles.violationGridBadge}>
@@ -298,15 +385,36 @@ export default function FilesScreen() {
             {selectedViolation && (
               <View style={styles.detailCard}>
                 <Text style={styles.detailTitle}>Chi tiết vi phạm</Text>
-                <Image
-                  source={{
-                    uri: selectedViolation.image_path?.startsWith('http')
-                      ? selectedViolation.image_path
-                      : `${BACKEND_BASE_URL}${selectedViolation.image_path}`,
+                <View
+                  style={styles.detailImageWrap}
+                  onLayout={(event) => {
+                    const { width, height } = event.nativeEvent.layout;
+                    setSelectedImageLayoutSize({ width, height });
                   }}
-                  style={styles.detailImage}
-                  resizeMode="contain"
-                />
+                >
+                  <Image
+                    source={{
+                      uri: selectedViolation.image_path?.startsWith('http')
+                        ? selectedViolation.image_path
+                        : `${BACKEND_BASE_URL}${selectedViolation.image_path}`,
+                    }}
+                    style={styles.detailImage}
+                    resizeMode="contain"
+                    onLoad={(event) => {
+                      const src = event.nativeEvent.source;
+                      if (src?.width && src?.height) {
+                        setSelectedImageNaturalSize({ width: src.width, height: src.height });
+                      }
+                    }}
+                  />
+                  <BoundingBoxOverlay
+                    detections={selectedViolation.detections || []}
+                    containerSize={selectedImageLayoutSize}
+                    sourceSize={selectedImageNaturalSize}
+                    colorMap={modelColorMap}
+                    labelMap={modelNameMap}
+                  />
+                </View>
                 <View style={styles.detailStats}>
                   <Text style={styles.detailStatText}>Phát hiện: {selectedViolation.detections?.length || 0}</Text>
                   <Text style={styles.detailStatText}>Thời gian: {(selectedViolation.timestamp / 1000).toFixed(2)}s</Text>
@@ -403,7 +511,16 @@ const styles = StyleSheet.create({
     backgroundColor: '#f8fafc', borderRadius: 10, padding: 12, marginTop: 8, borderWidth: 1, borderColor: '#e2e8f0',
   },
   detailTitle: { fontSize: 14, fontWeight: '600', color: '#1e293b', marginBottom: 8 },
-  detailImage: { width: '100%', height: 200, borderRadius: 8, backgroundColor: '#000', marginBottom: 8 },
+  detailImageWrap: {
+    width: '100%',
+    height: 200,
+    borderRadius: 8,
+    overflow: 'hidden',
+    backgroundColor: '#000',
+    marginBottom: 8,
+    position: 'relative',
+  },
+  detailImage: { width: '100%', height: '100%' },
   detailStats: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 },
   detailStatText: { fontSize: 13, color: '#475569', fontWeight: '500' },
   detailDetRow: {

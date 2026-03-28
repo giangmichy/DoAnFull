@@ -1,194 +1,60 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, ScrollView,
-  Alert, ActivityIndicator, Image, FlatList, Dimensions,
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  ScrollView,
+  Alert,
+  ActivityIndicator,
+  Image,
+  FlatList,
+  Dimensions,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
-import { Video, ResizeMode } from 'expo-av';
+import { Video, ResizeMode, AVPlaybackStatus } from 'expo-av';
 import { Ionicons } from '@expo/vector-icons';
-import { apiClient, BoundingBox } from '../api';
-import { BACKEND_BASE_URL, WS_URL } from '../config';
+import { apiClient } from '../api';
+import { BACKEND_BASE_URL } from '../config';
+import BoundingBoxOverlay from '../components/BoundingBoxOverlay';
+import { useRealtimeVideoDetection } from './detection/useRealtimeVideoDetection';
+import type { MediaType, ViolationFrame } from './detection/types';
 
-type ViolationFrame = {
-  frame_number: number;
-  timestamp: number;
-  image_path: string;
-  detections: any[];
-};
-
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 export default function DetectionScreen() {
   const [mediaUri, setMediaUri] = useState<string | null>(null);
-  const [mediaType, setMediaType] = useState<'image' | 'video' | null>(null);
+  const [mediaType, setMediaType] = useState<MediaType>(null);
   const [fileName, setFileName] = useState<string>('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [videoId, setVideoId] = useState<string>('');
-  const [isDetecting, setIsDetecting] = useState(false);
-  const [violationFrames, setViolationFrames] = useState<ViolationFrame[]>([]);
+  const [uploadedFileId, setUploadedFileId] = useState<string>('');
   const [imageDetections, setImageDetections] = useState<any[]>([]);
-  const [detectedImageUri, setDetectedImageUri] = useState<string | null>(null);
+  const [imageNaturalSize, setImageNaturalSize] = useState({ width: 0, height: 0 });
+  const [imageLayoutSize, setImageLayoutSize] = useState({ width: 0, height: 0 });
+  const [videoLayoutSize, setVideoLayoutSize] = useState({ width: 0, height: 0 });
+  const [videoNaturalSize, setVideoNaturalSize] = useState({ width: 0, height: 0 });
+  const [currentPositionMs, setCurrentPositionMs] = useState(0);
+  const [videoDurationMs, setVideoDurationMs] = useState(0);
+  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
+
   const videoRef = useRef<Video>(null);
-  const sseRef = useRef<any>(null);
-  const wsRef = useRef<WebSocket | null>(null);
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (sseRef.current) {
-        sseRef.current.close?.();
-        sseRef.current = null;
-      }
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-    };
-  }, []);
-
-  const pickMedia = async () => {
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images', 'videos'],
-      quality: 0.8,
-    });
-
-    if (result.canceled || !result.assets?.[0]) return;
-
-    const asset = result.assets[0];
-    const type = asset.type === 'video' ? 'video' : 'image';
-    const name = asset.fileName || `file_${Date.now()}.${type === 'video' ? 'mp4' : 'jpg'}`;
-
-    // Reset state
-    setViolationFrames([]);
-    setImageDetections([]);
-    setDetectedImageUri(null);
-    setIsDetecting(false);
-    closeSse();
-
-    setMediaUri(asset.uri);
-    setMediaType(type);
-    setFileName(name);
-
-    if (type === 'video') {
-      const vid = Date.now().toString();
-      setVideoId(vid);
-      // Upload video to backend
-      try {
-        await apiClient.uploadFile(asset.uri, name, vid);
-      } catch (err: any) {
-        console.warn('Upload error:', err.message);
-      }
-    }
-  };
-
-  const closeSse = () => {
-    // React Native doesn't have native EventSource, we use fetch streaming
-    if (sseRef.current?.abort) {
-      sseRef.current.abort();
-    }
-    sseRef.current = null;
-  };
-
-  const startVideoDetection = useCallback(() => {
-    if (!videoId) return;
-    setIsDetecting(true);
-    setViolationFrames([]);
-
-    // Use fetch-based SSE for React Native
-    const controller = new AbortController();
-    sseRef.current = controller;
-
-    const streamUrl = `${BACKEND_BASE_URL}/file-stream/${videoId}`;
-    
-    fetch(streamUrl, { signal: controller.signal })
-      .then(async (response) => {
-        const reader = response.body?.getReader();
-        if (!reader) return;
-        
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const payload = JSON.parse(line.slice(6));
-                if (payload.type === 'violation' && payload.data) {
-                  setViolationFrames(prev => {
-                    const exists = prev.some(
-                      v => v.frame_number === payload.data.frame_number
-                    );
-                    if (exists) return prev;
-                    return [...prev, payload.data].sort((a, b) => a.timestamp - b.timestamp);
-                  });
-                }
-              } catch { /* skip invalid */ }
-            }
-          }
-        }
-      })
-      .catch((err) => {
-        if (err.name !== 'AbortError') {
-          console.warn('SSE error:', err);
-        }
-      })
-      .finally(() => {
-        setIsDetecting(false);
-      });
-  }, [videoId]);
-
-  const detectImage = useCallback(async () => {
-    if (!mediaUri || !fileName) return;
-    setIsProcessing(true);
-    setImageDetections([]);
-    try {
-      const result = await apiClient.detectImage(mediaUri, fileName);
-      if (result.detections && result.detections.length > 0) {
-        setImageDetections(result.detections);
-      } else {
-        Alert.alert('Kết quả', 'Không phát hiện vi phạm nào');
-      }
-    } catch (err: any) {
-      Alert.alert('Lỗi', err.message || 'Phát hiện thất bại');
-    } finally {
-      setIsProcessing(false);
-    }
-  }, [mediaUri, fileName]);
-
-  const handleDetect = () => {
-    if (mediaType === 'image') {
-      detectImage();
-    } else if (mediaType === 'video') {
-      if (isDetecting) {
-        closeSse();
-        setIsDetecting(false);
-      } else {
-        startVideoDetection();
-      }
-    }
-  };
-
-  const renderViolationItem = ({ item }: { item: ViolationFrame }) => {
-    const imageUrl = item.image_path?.startsWith('http')
-      ? item.image_path
-      : `${BACKEND_BASE_URL}${item.image_path}`;
-    return (
-      <TouchableOpacity style={styles.violationCard}>
-        <Image source={{ uri: imageUrl }} style={styles.violationImage} resizeMode="cover" />
-        <View style={styles.violationBadge}>
-          <Text style={styles.violationBadgeText}>{item.detections?.length || 0}</Text>
-        </View>
-        <Text style={styles.violationTime}>{(item.timestamp / 1000).toFixed(1)}s</Text>
-      </TouchableOpacity>
-    );
-  };
+  const {
+    isDetecting,
+    violationFrames,
+    currentVideoBoxes,
+    startVideoDetection,
+    stopDetection,
+    resetRealtimeState,
+  } = useRealtimeVideoDetection({
+    videoRef,
+    mediaUri,
+    mediaType,
+    videoId,
+    uploadedFileId,
+    isVideoPlaying,
+    currentPositionMs,
+  });
 
   const modelColorMap: Record<string, string> = {
     co3soc: '#ef4444',
@@ -202,9 +68,111 @@ export default function DetectionScreen() {
     vnmap: 'Bản đồ VN',
   };
 
+  const detectImageBySource = useCallback(async (uri: string, name: string) => {
+    setIsProcessing(true);
+    setImageDetections([]);
+    try {
+      const result = await apiClient.detectImage(uri, name);
+      if (result.detections && result.detections.length > 0) {
+        setImageDetections(result.detections);
+      } else {
+        Alert.alert('Kết quả', 'Không phát hiện vi phạm nào');
+      }
+    } catch (err: any) {
+      Alert.alert('Lỗi', err.message || 'Phát hiện thất bại');
+    } finally {
+      setIsProcessing(false);
+    }
+  }, []);
+
+  const pickMedia = async () => {
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images', 'videos'],
+      quality: 0.8,
+    });
+
+    if (result.canceled || !result.assets?.[0]) return;
+
+    const asset = result.assets[0];
+    const type: MediaType = asset.type === 'video' ? 'video' : 'image';
+    const name = asset.fileName || `file_${Date.now()}.${type === 'video' ? 'mp4' : 'jpg'}`;
+
+    resetRealtimeState();
+
+    setImageDetections([]);
+    setUploadedFileId('');
+    setCurrentPositionMs(0);
+    setVideoDurationMs(0);
+    setImageNaturalSize({ width: 0, height: 0 });
+    setVideoNaturalSize({ width: 0, height: 0 });
+    setMediaUri(asset.uri);
+    setMediaType(type);
+    setFileName(name);
+
+    if (type === 'video') {
+      const vid = Date.now().toString();
+      setVideoId(vid);
+      try {
+        const uploaded = await apiClient.uploadFile(asset.uri, name, vid);
+        setUploadedFileId(uploaded.id);
+      } catch (err: any) {
+        Alert.alert('Upload lỗi', err?.message || 'Không thể tải video lên backend');
+      }
+      return;
+    }
+
+    setVideoId('');
+  };
+
+  const handleDetect = () => {
+    if (mediaType === 'image') {
+      if (!mediaUri || !fileName) return;
+      void detectImageBySource(mediaUri, fileName);
+      return;
+    }
+
+    if (mediaType === 'video') {
+      if (isDetecting) {
+        stopDetection();
+      } else {
+        const ok = startVideoDetection();
+        if (!ok) {
+          Alert.alert('Thiếu dữ liệu', 'Chưa có videoId để bắt đầu phát hiện');
+        }
+      }
+    }
+  };
+
+  const handleSeekToViolation = async (timestamp: number) => {
+    if (!videoRef.current) return;
+    try {
+      await videoRef.current.setPositionAsync(timestamp);
+      setCurrentPositionMs(timestamp);
+    } catch {
+      // ignore seek error
+    }
+  };
+
+  const renderViolationItem = ({ item }: { item: ViolationFrame }) => {
+    const imageUrl = item.image_path?.startsWith('http')
+      ? item.image_path
+      : `${BACKEND_BASE_URL}${item.image_path}`;
+    return (
+      <TouchableOpacity
+        style={styles.violationCard}
+        onPress={() => handleSeekToViolation(item.timestamp)}
+      >
+        <Image source={{ uri: imageUrl }} style={styles.violationImage} resizeMode="cover" />
+        <View style={styles.violationBadge}>
+          <Text style={styles.violationBadgeText}>{item.detections?.length || 0}</Text>
+        </View>
+        <Text style={styles.violationTime}>{(item.timestamp / 1000).toFixed(1)}s</Text>
+      </TouchableOpacity>
+    );
+  };
+
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      {/* Upload Area */}
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Cài đặt phân tích</Text>
         <TouchableOpacity style={styles.uploadArea} onPress={pickMedia}>
@@ -216,9 +184,12 @@ export default function DetectionScreen() {
           <View style={styles.fileInfo}>
             <Ionicons
               name={mediaType === 'video' ? 'videocam-outline' : 'image-outline'}
-              size={18} color="#64748b"
+              size={18}
+              color="#64748b"
             />
-            <Text style={styles.fileInfoText} numberOfLines={1}>{fileName}</Text>
+            <Text style={styles.fileInfoText} numberOfLines={1}>
+              {fileName}
+            </Text>
           </View>
         ) : null}
 
@@ -234,30 +205,102 @@ export default function DetectionScreen() {
           )}
           <Text style={styles.detectButtonText}>
             {mediaType === 'video'
-              ? (isDetecting ? 'Dừng phát hiện' : 'Bắt đầu phát hiện')
-              : (isProcessing ? 'Đang phân tích...' : 'Bắt đầu phát hiện')}
+              ? isDetecting
+                ? 'Dừng phát hiện'
+                : 'Bắt đầu phát hiện'
+              : isProcessing
+                ? 'Đang phân tích...'
+                : 'Bắt đầu phát hiện'}
           </Text>
         </TouchableOpacity>
       </View>
 
-      {/* Media Preview */}
       {mediaUri && (
         <View style={styles.card}>
           {mediaType === 'video' ? (
-            <Video
-              ref={videoRef}
-              source={{ uri: mediaUri }}
-              style={styles.mediaPreview}
-              useNativeControls
-              resizeMode={ResizeMode.CONTAIN}
-            />
+            <>
+              <View
+                style={styles.videoPreviewWrap}
+                onLayout={(event) => {
+                  const { width, height } = event.nativeEvent.layout;
+                  setVideoLayoutSize({ width, height });
+                }}
+              >
+                <Video
+                  ref={videoRef}
+                  source={{ uri: mediaUri }}
+                  style={styles.mediaPreview}
+                  useNativeControls
+                  progressUpdateIntervalMillis={200}
+                  resizeMode={ResizeMode.CONTAIN}
+                  onReadyForDisplay={(event) => {
+                    const naturalSize = event.naturalSize;
+                    if (naturalSize?.width && naturalSize?.height) {
+                      setVideoNaturalSize({
+                        width: naturalSize.width,
+                        height: naturalSize.height,
+                      });
+                    }
+                  }}
+                  onPlaybackStatusUpdate={(status: AVPlaybackStatus) => {
+                    if (!status.isLoaded) {
+                      setIsVideoPlaying(false);
+                      return;
+                    }
+                    setIsVideoPlaying(!!status.isPlaying);
+                    setCurrentPositionMs(status.positionMillis || 0);
+                    setVideoDurationMs(status.durationMillis || 0);
+                  }}
+                />
+                <BoundingBoxOverlay
+                  detections={currentVideoBoxes}
+                  containerSize={videoLayoutSize}
+                  sourceSize={
+                    videoNaturalSize.width && videoNaturalSize.height
+                      ? videoNaturalSize
+                      : videoLayoutSize
+                  }
+                  colorMap={modelColorMap}
+                  labelMap={modelNameMap}
+                />
+              </View>
+              <View style={styles.videoTimeRow}>
+                <Text style={styles.videoTimeText}>
+                  {(currentPositionMs / 1000).toFixed(1)}s / {(videoDurationMs / 1000).toFixed(1)}s
+                </Text>
+              </View>
+            </>
           ) : (
-            <Image source={{ uri: mediaUri }} style={styles.mediaPreview} resizeMode="contain" />
+            <View
+              style={styles.imagePreviewWrap}
+              onLayout={(event) => {
+                const { width, height } = event.nativeEvent.layout;
+                setImageLayoutSize({ width, height });
+              }}
+            >
+              <Image
+                source={{ uri: mediaUri }}
+                style={styles.mediaPreview}
+                resizeMode="contain"
+                onLoad={(event) => {
+                  const src = event.nativeEvent.source;
+                  if (src?.width && src?.height) {
+                    setImageNaturalSize({ width: src.width, height: src.height });
+                  }
+                }}
+              />
+              <BoundingBoxOverlay
+                detections={imageDetections}
+                containerSize={imageLayoutSize}
+                sourceSize={imageNaturalSize}
+                colorMap={modelColorMap}
+                labelMap={modelNameMap}
+              />
+            </View>
           )}
         </View>
       )}
 
-      {/* Image Detection Results */}
       {imageDetections.length > 0 && (
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Kết quả phát hiện</Text>
@@ -276,7 +319,6 @@ export default function DetectionScreen() {
         </View>
       )}
 
-      {/* Video Violation Frames */}
       {mediaType === 'video' && (
         <View style={styles.card}>
           <View style={styles.cardTitleRow}>
@@ -322,7 +364,12 @@ const styles = StyleSheet.create({
     elevation: 2,
   },
   cardTitle: { fontSize: 15, fontWeight: '600', color: '#1e293b', marginBottom: 12 },
-  cardTitleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
+  cardTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
   uploadArea: {
     borderWidth: 2,
     borderColor: '#e2e8f0',
@@ -356,6 +403,24 @@ const styles = StyleSheet.create({
   detectButtonDisabled: { opacity: 0.5 },
   detectButtonText: { color: '#fff', fontSize: 15, fontWeight: '600' },
   mediaPreview: { width: '100%', height: 250, borderRadius: 8, backgroundColor: '#000' },
+  videoPreviewWrap: {
+    width: '100%',
+    height: 250,
+    borderRadius: 8,
+    overflow: 'hidden',
+    backgroundColor: '#000',
+    position: 'relative',
+  },
+  imagePreviewWrap: {
+    width: '100%',
+    height: 250,
+    borderRadius: 8,
+    overflow: 'hidden',
+    backgroundColor: '#000',
+    position: 'relative',
+  },
+  videoTimeRow: { marginTop: 8, alignItems: 'flex-end' },
+  videoTimeText: { fontSize: 12, color: '#64748b', fontWeight: '500' },
   detectionRow: {
     flexDirection: 'row',
     alignItems: 'center',
